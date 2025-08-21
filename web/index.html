@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Viewer (noVNC)</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --panel: #111827;
+        --text: #e5e7eb;
+        --muted: #9ca3af;
+        --accent: #22c55e;
+        --danger: #ef4444;
+      }
+      html, body {
+        height: 100%;
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      }
+      .layout {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        height: 100%;
+      }
+      header {
+        padding: 12px 16px;
+        background: var(--panel);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      header h1 {
+        font-size: 16px;
+        margin: 0 8px 0 0;
+        color: var(--text);
+      }
+      label {
+        font-size: 12px;
+        color: var(--muted);
+        display: block;
+        margin-bottom: 4px;
+      }
+      .field {
+        display: flex;
+        flex-direction: column;
+        min-width: 220px;
+      }
+      input[type="text"], input[type="password"] {
+        background: #0b1220;
+        border: 1px solid #1f2937;
+        color: var(--text);
+        padding: 8px 10px;
+        border-radius: 6px;
+        outline: none;
+      }
+      input[type="text"]::placeholder, input[type="password"]::placeholder {
+        color: #6b7280;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: end;
+        flex-wrap: wrap;
+        margin-left: auto;
+      }
+      button {
+        appearance: none;
+        border: 1px solid #1f2937;
+        background: #0b1220;
+        color: var(--text);
+        padding: 8px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button.primary { border-color: #14532d; background: #052e16; }
+      button.danger { border-color: #7f1d1d; background: #2a0f10; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      .status {
+        padding: 8px 16px;
+        background: #0b1220;
+        border-top: 1px solid #1f2937;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      #screen {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+      }
+      .canvas-wrap {
+        height: 100%;
+        display: grid;
+        place-items: center;
+        background: #000;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <header>
+        <h1>Agent Viewer</h1>
+        <div class="controls">
+          <button id="startContainerBtn" class="primary">Start Container</button>
+          <button id="refreshContainersBtn">Refresh Containers</button>
+          <button id="toggleInteractionBtn" disabled>🔒 Read Only</button>
+        </div>
+      </header>
+      <div style="padding: 8px 16px; background: var(--panel); border-bottom: 1px solid #1f2937;">
+        <label style="font-size: 12px; color: var(--muted); margin-bottom: 4px; display: block;">Running Containers</label>
+        <div id="containerList" style="display: flex; gap: 8px; flex-wrap: wrap; min-height: 32px; align-items: center;">
+          <span style="color: var(--muted); font-size: 12px;">No containers running</span>
+        </div>
+      </header>
+      <div class="canvas-wrap">
+        <div id="screen"></div>
+      </div>
+              <div class="status" id="status">Ready. Click "Start Container" to create a new agent session.</div>
+    </div>
+
+    <!-- Hidden inputs for internal use -->
+    <input id="wsUrl" type="hidden" />
+    <input id="password" type="hidden" />
+
+    <script type="module">
+      let RFB;
+      try {
+        const sources = [
+          // Local vendored copy first
+          "/vendor/noVNC/core/rfb.js",
+          // Prefer GitHub tag via jsDelivr, paths match repo structure (keeps relative imports working)
+          "https://cdn.jsdelivr.net/gh/novnc/noVNC@v1.5.0/core/rfb.js",
+          // esm.sh bundles internal imports into a single ESM for reliability
+          "https://esm.sh/@novnc/novnc@1.5.0/core/rfb.js?bundle",
+          // Fallbacks: npm CDNs (may not always publish /core in the package)
+          "https://cdn.jsdelivr.net/npm/@novnc/novnc@1.5.0/core/rfb.js",
+          "https://unpkg.com/@novnc/novnc@1.5.0/core/rfb.js?module"
+        ];
+        let lastErr = null;
+        for (const src of sources) {
+          try {
+            RFB = (await import(src)).default;
+            break;
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        if (!RFB) {
+          document.getElementById("status").textContent = "Failed to load noVNC library";
+          throw lastErr || new Error("noVNC import failed");
+        }
+      } catch (e) {
+        console.error(e);
+      }
+
+      const screen = document.getElementById("screen");
+      const status = document.getElementById("status");
+      const wsUrlInput = document.getElementById("wsUrl");
+      const passwordInput = document.getElementById("password");
+      const startContainerBtn = document.getElementById("startContainerBtn");
+      const refreshContainersBtn = document.getElementById("refreshContainersBtn");
+      const toggleInteractionBtn = document.getElementById("toggleInteractionBtn");
+      const containerList = document.getElementById("containerList");
+
+      let isInteractive = false;
+
+      let rfb = null;
+
+      function deriveDefaultWsUrl() {
+        const isHttps = window.location.protocol === "https:";
+        const scheme = isHttps ? "wss" : "ws";
+        // Always default to 6080 where websockify typically runs locally
+        return `${scheme}://${window.location.hostname || "localhost"}:6080`;
+      }
+
+      // Pre-fill sensible default
+      if (!wsUrlInput.value) {
+        wsUrlInput.value = deriveDefaultWsUrl();
+      }
+
+      function setStatus(text) {
+        status.textContent = text;
+      }
+
+      function onConnected() {
+        setStatus("Connected");
+        toggleInteractionBtn.disabled = false;
+        updateInteractionMode();
+      }
+
+      function onDisconnected(e) {
+        const detail = e && e.detail ? ` (${e.detail.reason || ""})` : "";
+        setStatus(`Disconnected${detail}`);
+        toggleInteractionBtn.disabled = true;
+      }
+
+      function onCredentialsRequired() {
+        setStatus("Credentials required by VNC server");
+      }
+
+      async function connect() {
+        const url = wsUrlInput.value.trim();
+        if (!url) {
+          setStatus("Please provide a WebSocket proxy URL (e.g., ws://localhost:6080)");
+          return;
+        }
+        
+        // Ensure we're disconnected first
+        if (rfb) {
+          disconnect();
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
+        try {
+          console.log("Creating new RFB connection to:", url);
+          rfb = new RFB(screen, url, passwordInput.value ? { credentials: { password: passwordInput.value } } : undefined);
+          rfb.viewOnly = !isInteractive;  // Set based on current interaction mode
+          rfb.scaleViewport = true;
+          rfb.resizeSession = true;
+          rfb.qualityLevel = 6;
+          rfb.compressionLevel = 2;
+
+          rfb.addEventListener("connect", onConnected);
+          rfb.addEventListener("disconnect", onDisconnected);
+          rfb.addEventListener("credentialsrequired", onCredentialsRequired);
+
+          setStatus("Connecting...");
+        } catch (err) {
+          console.error("Connect error:", err);
+          setStatus(`Failed to connect: ${String(err)}`);
+          rfb = null;
+        }
+      }
+
+      function disconnect() {
+        if (rfb) {
+          try { 
+            rfb.disconnect(); 
+            rfb = null;
+          } catch (_) {}
+        }
+        onDisconnected();
+      }
+
+      async function switchToContainer(containerId, vncPort) {
+        try {
+          // First, properly disconnect from current container
+          if (rfb) {
+            console.log("Disconnecting from current container...");
+            setStatus("Disconnecting from current container...");
+            disconnect();
+            // Wait a moment for the disconnect to complete
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+
+          // Clear the screen
+          const screen = document.getElementById("screen");
+          screen.innerHTML = "";
+
+          // Set up new connection
+          const isHttps = window.location.protocol === "https:";
+          const scheme = isHttps ? "wss" : "ws";
+          const wsUrl = `${scheme}://${window.location.hostname}:8124/vnc/${containerId}`;
+          
+          console.log(`Switching to container ${containerId.slice(0, 8)}... (VNC :${vncPort})`);
+          wsUrlInput.value = wsUrl;
+          passwordInput.value = "hyperaccs";
+          setStatus(`Connecting to container ${containerId.slice(0, 8)}...`);
+          
+          // Wait a moment before connecting
+          await new Promise(resolve => setTimeout(resolve, 200));
+          
+          await connect();
+        } catch (e) {
+          console.error("Switch container error:", e);
+          setStatus(`Failed to switch container: ${String(e)}`);
+        }
+      }
+
+      startContainerBtn.addEventListener("click", startContainer);
+      refreshContainersBtn.addEventListener("click", refreshContainers);
+      toggleInteractionBtn.addEventListener("click", toggleInteraction);
+
+      function toggleInteraction() {
+        isInteractive = !isInteractive;
+        updateInteractionMode();
+        
+        // If connected, update the RFB connection immediately
+        if (rfb) {
+          rfb.viewOnly = !isInteractive;
+          console.log(`Interaction mode: ${isInteractive ? 'Interactive' : 'Read Only'}`);
+        }
+      }
+
+      function updateInteractionMode() {
+        if (isInteractive) {
+          toggleInteractionBtn.textContent = "🖱️ Interactive";
+          toggleInteractionBtn.style.background = "#052e16";
+          toggleInteractionBtn.style.borderColor = "#14532d";
+          setStatus(rfb ? "Connected - Interactive mode" : "Disconnected");
+        } else {
+          toggleInteractionBtn.textContent = "🔒 Read Only";
+          toggleInteractionBtn.style.background = "#0b1220";
+          toggleInteractionBtn.style.borderColor = "#1f2937";
+          setStatus(rfb ? "Connected - Read only mode" : "Disconnected");
+        }
+      }
+
+      async function refreshContainers() {
+        const apiUrl = `${window.location.protocol}//${window.location.hostname}:8123/api/containers`;
+        try {
+          const resp = await fetch(apiUrl);
+          if (!resp.ok) throw new Error(`API error ${resp.status}`);
+          const containers = await resp.json();
+          
+          containerList.innerHTML = "";
+          if (Object.keys(containers).length === 0) {
+            containerList.innerHTML = '<span style="color: var(--muted); font-size: 12px;">No containers running</span>';
+          } else {
+            Object.entries(containers).forEach(([containerId, info]) => {
+              const containerDiv = document.createElement("div");
+              containerDiv.style.cssText = "display: flex; align-items: center; gap: 4px; margin-bottom: 4px;";
+              
+              const connectBtn = document.createElement("button");
+              connectBtn.textContent = `${containerId.slice(0, 8)}... (VNC :${info.vncPort})`;
+              connectBtn.style.cssText = "font-size: 11px; padding: 4px 8px; margin: 0; flex: 1;";
+              connectBtn.addEventListener("click", () => {
+                switchToContainer(containerId, info.vncPort);
+              });
+              
+              const stopBtn = document.createElement("button");
+              stopBtn.textContent = "Stop";
+              stopBtn.style.cssText = "font-size: 10px; padding: 2px 6px; margin: 0; background: #7f1d1d; border-color: #7f1d1d; color: white;";
+              stopBtn.addEventListener("click", async () => {
+                if (confirm(`Stop container ${containerId.slice(0, 8)}...?`)) {
+                  try {
+                    stopBtn.disabled = true;
+                    stopBtn.textContent = "...";
+                    const resp = await fetch(`${window.location.protocol}//${window.location.hostname}:8123/api/containers/${containerId}/stop`, { method: "POST" });
+                    if (!resp.ok) throw new Error(`Failed to stop: ${resp.status}`);
+                    setStatus(`Container ${containerId.slice(0, 8)}... stopped`);
+                    await refreshContainers();
+                  } catch (e) {
+                    console.error("Stop container error:", e);
+                    setStatus(`Failed to stop container: ${String(e)}`);
+                    stopBtn.disabled = false;
+                    stopBtn.textContent = "Stop";
+                  }
+                }
+              });
+              
+              containerDiv.appendChild(connectBtn);
+              containerDiv.appendChild(stopBtn);
+              containerList.appendChild(containerDiv);
+            });
+          }
+        } catch (e) {
+          console.error("Failed to refresh containers:", e);
+          setStatus(`Failed to refresh containers: ${String(e)}`);
+        }
+      }
+
+      async function startContainer() {
+        const apiUrl = `${window.location.protocol}//${window.location.hostname}:8123/api/containers/start`;
+        try {
+          startContainerBtn.disabled = true;
+          setStatus("Starting container...");
+          console.log("Calling API:", apiUrl);
+          const resp = await fetch(apiUrl, { method: "POST" });
+          console.log("API response status:", resp.status);
+          if (!resp.ok) {
+            const txt = await resp.text();
+            console.error("API error response:", txt);
+            throw new Error(`API error ${resp.status}: ${txt}`);
+          }
+          const data = await resp.json();
+          console.log("API response data:", data);
+          const containerId = data.containerId;
+          if (!containerId) throw new Error("No containerId from API");
+          const isHttps = window.location.protocol === "https:";
+          const scheme = isHttps ? "wss" : "ws";
+          const wsUrl = `${scheme}://${window.location.hostname}:8124/vnc/${containerId}`;
+          console.log("Setting WebSocket URL:", wsUrl);
+          wsUrlInput.value = wsUrl;
+          // Set the default VNC password
+          passwordInput.value = "hyperaccs";
+          setStatus("Connecting to container...");
+          await connect();
+          setStatus(`Container ${data.containerId.slice(0, 8)}... ready (VNC :${data.vncPort})`);
+          // Refresh the container list
+          await refreshContainers();
+        } catch (e) {
+          console.error("Container start error:", e);
+          setStatus(`Failed to start container: ${String(e)}`);
+        } finally {
+          startContainerBtn.disabled = false;
+        }
+      }
+
+
+
+      // Allow deep-link via vnc://[[:password]@]host:port with optional autoconnect
+      // Examples:
+      // - index.html#vnc=vnc://localhost:5900
+      // - index.html?vnc=vnc://:secret@192.168.1.10:5901&autoconnect=1
+      try {
+        const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+        const query = new URLSearchParams(window.location.search);
+        const getParam = (k) => fragment.get(k) ?? query.get(k);
+        const vncUri = getParam("vnc");
+        const autoconnect = (getParam("autoconnect") || "").toLowerCase();
+        const shouldAuto = ["1", "true", "yes", "y"].includes(autoconnect) || !!vncUri;
+        if (vncUri && vncUri.startsWith("vnc://")) {
+          const withoutScheme = vncUri.slice("vnc://".length);
+          let credPart = "";
+          let hostPortPart = withoutScheme;
+          if (withoutScheme.includes("@")) {
+            [credPart, hostPortPart] = withoutScheme.split("@");
+            // Only password supported in browsers (username ignored). Accept formats like :password@host:port
+            if (credPart.startsWith(":")) {
+              passwordInput.value = decodeURIComponent(credPart.slice(1));
+            }
+          }
+          const [host, port] = hostPortPart.split(":");
+          const isHttps = window.location.protocol === "https:";
+          const scheme = isHttps ? "wss" : "ws";
+          const proxyPort = "6080";
+          wsUrlInput.value = `${scheme}://${window.location.hostname || host}:${proxyPort}`;
+          if (shouldAuto) {
+            // Delay a tick to allow inputs to render
+            setTimeout(connect, 0);
+          }
+        }
+      } catch (_) {}
+
+      // Load container list on page load
+      refreshContainers();
+    </script>
+  </body>
+  </html>
+
+
